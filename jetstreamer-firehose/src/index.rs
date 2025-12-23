@@ -40,7 +40,9 @@ use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
 use std::{
     collections::HashMap,
+    io::SeekFrom,
     ops::RangeInclusive,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -48,7 +50,12 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::{sync::OnceCell, task::yield_now, time::sleep};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::OnceCell,
+    task::yield_now,
+    time::sleep,
+};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -84,6 +91,9 @@ pub enum SlotOffsetIndexError {
     /// Unexpected HTTP status returned while fetching index data.
     #[error("unexpected HTTP status {1} when fetching {0}")]
     HttpStatusError(Url, StatusCode),
+    /// Failed to read a local index artifact.
+    #[error("failed to read local index {0}: {1}")]
+    LocalIoError(PathBuf, String),
     /// Index payload was malformed.
     #[error("invalid index format at {0}: {1}")]
     IndexFormatError(Url, String),
@@ -98,6 +108,7 @@ pub enum SlotOffsetIndexError {
 
 enum IndexBackend {
     Http,
+    Local(PathBuf),
     #[cfg(feature = "s3-backend")]
     S3(Arc<S3Location>),
 }
@@ -111,6 +122,9 @@ enum RemoteObjectKind {
     Http {
         client: Client,
     },
+    Local {
+        path: PathBuf,
+    },
     #[cfg(feature = "s3-backend")]
     S3 {
         location: Arc<S3Location>,
@@ -122,6 +136,13 @@ impl RemoteObject {
     fn http(client: Client, url: Url) -> Self {
         Self {
             kind: RemoteObjectKind::Http { client },
+            url,
+        }
+    }
+
+    fn local(path: PathBuf, url: Url) -> Self {
+        Self {
+            kind: RemoteObjectKind::Local { path },
             url,
         }
     }
@@ -141,6 +162,7 @@ impl RemoteObject {
     async fn fetch_full(&self) -> Result<Vec<u8>, SlotOffsetIndexError> {
         match &self.kind {
             RemoteObjectKind::Http { client } => fetch_full(client, &self.url).await,
+            RemoteObjectKind::Local { path } => fetch_local_full(path).await,
             #[cfg(feature = "s3-backend")]
             RemoteObjectKind::S3 { location, key } => {
                 fetch_s3_full(location, key.as_str(), &self.url).await
@@ -157,6 +179,9 @@ impl RemoteObject {
         match &self.kind {
             RemoteObjectKind::Http { client } => {
                 fetch_http_range(client, &self.url, start, end, exact).await
+            }
+            RemoteObjectKind::Local { path } => {
+                fetch_local_range(path, start, end, exact, &self.url).await
             }
             #[cfg(feature = "s3-backend")]
             RemoteObjectKind::S3 { location, key } => {
@@ -238,6 +263,13 @@ impl SlotOffsetIndex {
         let location = archive::index_location();
         let backend = if location.is_http() {
             IndexBackend::Http
+        } else if location.is_local() {
+            IndexBackend::Local(
+                location
+                    .as_local_path()
+                    .expect("local index backend without path")
+                    .to_path_buf(),
+            )
         } else {
             #[cfg(feature = "s3-backend")]
             {
@@ -362,6 +394,12 @@ impl SlotOffsetIndex {
                     SlotOffsetIndexError::InvalidIndexUrl(format!("{path} ({err})"))
                 })?;
                 Ok(RemoteObject::http(self.client.clone(), url))
+            }
+            IndexBackend::Local(base_path) => {
+                let url = self.base_url.join(path).map_err(|err| {
+                    SlotOffsetIndexError::InvalidIndexUrl(format!("{path} ({err})"))
+                })?;
+                Ok(RemoteObject::local(base_path.join(path), url))
             }
             #[cfg(feature = "s3-backend")]
             IndexBackend::S3(location) => {
@@ -1319,6 +1357,12 @@ async fn read_response_with_progress(
     Ok(bytes)
 }
 
+async fn fetch_local_full(path: &PathBuf) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    tokio::fs::read(path)
+        .await
+        .map_err(|err| SlotOffsetIndexError::LocalIoError(path.clone(), err.to_string()))
+}
+
 async fn fetch_http_range(
     client: &Client,
     url: &Url,
@@ -1433,6 +1477,56 @@ async fn fetch_http_range(
         }
         return Ok(bytes.to_vec());
     }
+}
+
+async fn fetch_local_range(
+    path: &PathBuf,
+    start: u64,
+    end: u64,
+    exact: bool,
+    url: &Url,
+) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    if end < start {
+        return Ok(Vec::new());
+    }
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| SlotOffsetIndexError::LocalIoError(path.clone(), err.to_string()))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|err| SlotOffsetIndexError::LocalIoError(path.clone(), err.to_string()))?
+        .len();
+
+    if start >= len {
+        return Ok(Vec::new());
+    }
+
+    if exact && end >= len {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            "requested range extends past end of local file".into(),
+        ));
+    }
+
+    let capped_end = end.min(len.saturating_sub(1));
+    let to_read = capped_end.saturating_sub(start).saturating_add(1);
+
+    let byte_count: usize = to_read.try_into().map_err(|_| {
+        SlotOffsetIndexError::IndexFormatError(url.clone(), "range too large".into())
+    })?;
+
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|err| SlotOffsetIndexError::LocalIoError(path.clone(), err.to_string()))?;
+
+    let mut buffer = vec![0u8; byte_count];
+    file.read_exact(&mut buffer)
+        .await
+        .map_err(|err| SlotOffsetIndexError::LocalIoError(path.clone(), err.to_string()))?;
+
+    Ok(buffer)
 }
 
 #[cfg(feature = "s3-backend")]

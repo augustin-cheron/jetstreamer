@@ -1,7 +1,7 @@
 use reqwest::Client;
 use rseek::Seekable;
 use serde::Deserialize;
-use std::{fmt, io, pin::Pin};
+use std::{fmt, io, path::PathBuf, pin::Pin};
 use tokio::io::{AsyncRead, AsyncSeek, BufReader, ReadBuf, SeekFrom};
 
 use crate::archive;
@@ -104,6 +104,12 @@ pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
     let location = archive::car_location();
     let path = format!("{epoch}/epoch-{epoch}.car");
 
+    if let Some(base_path) = location.as_local_path() {
+        let local_path = base_path.join(&path);
+        let zst_path = car_zst_path(&local_path);
+        return local_path.exists() || zst_path.exists();
+    }
+
     if location.is_http() {
         let url = location
             .url()
@@ -139,6 +145,15 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
     let location = archive::car_location();
     let path = format!("{epoch}/epoch-{epoch}.car");
 
+    if let Some(base_path) = location.as_local_path() {
+        let local_path = base_path.join(&path);
+        let reader = open_local_car(&local_path)
+            .await
+            .unwrap_or_else(|err| panic!("failed to open local CAR for epoch {epoch}: {err}"));
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
+        return EpochStream::new(reader);
+    }
+
     if location.is_http() {
         let url = location
             .url()
@@ -164,6 +179,106 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
         "unsupported archive backend for CAR location {}",
         location.url()
     );
+}
+
+async fn open_local_car(path: &PathBuf) -> Result<LocalFile, std::io::Error> {
+    if path.exists() {
+        return LocalFile::from_path(path).await;
+    }
+
+    let zst_path = car_zst_path(path);
+    if zst_path.exists() {
+        return LocalFile::from_compressed(&zst_path).await;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no CAR or CAR.ZST found at {path:?}"),
+    ))
+}
+
+fn car_zst_path(path: &PathBuf) -> PathBuf {
+    let mut zst_path = path.clone();
+    zst_path.set_extension("car.zst");
+    zst_path
+}
+
+struct LocalFile {
+    file: tokio::fs::File,
+    len: u64,
+    #[allow(dead_code)]
+    temp: Option<tempfile::TempPath>,
+}
+
+impl LocalFile {
+    async fn from_path(path: &PathBuf) -> Result<Self, std::io::Error> {
+        let file = tokio::fs::File::open(path).await?;
+        let len = file.metadata().await?.len();
+        Ok(Self {
+            file,
+            len,
+            temp: None,
+        })
+    }
+
+    async fn from_compressed(path: &PathBuf) -> Result<Self, std::io::Error> {
+        let (file, len, temp) = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || {
+                let source = std::fs::File::open(&path)?;
+                let mut decoder = zstd::stream::Decoder::new(source)?;
+                let temp = tempfile::Builder::new()
+                    .prefix("jetstreamer-epoch-")
+                    .suffix(".car")
+                    .tempfile()?;
+                std::io::copy(&mut decoder, temp.as_file())?;
+                let len = temp.as_file().metadata()?.len();
+                let temp_path = temp.into_temp_path();
+                let output = std::fs::File::open(&temp_path)?;
+                Ok::<_, std::io::Error>((output, len, temp_path))
+            }
+        })
+        .await
+        .unwrap()?;
+
+        let file = tokio::fs::File::from_std(file);
+        Ok(Self {
+            file,
+            len,
+            temp: Some(temp),
+        })
+    }
+}
+
+impl AsyncRead for LocalFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for LocalFile {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        Pin::new(&mut this.file).start_seek(position)
+    }
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        Pin::new(&mut this.file).poll_complete(cx)
+    }
+}
+
+impl Len for LocalFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 #[cfg(feature = "s3-backend")]

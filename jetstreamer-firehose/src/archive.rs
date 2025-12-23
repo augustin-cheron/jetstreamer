@@ -3,7 +3,10 @@
 
 use once_cell::sync::Lazy;
 use reqwest::Url;
-use std::env;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 use url::ParseError;
 
 #[cfg(feature = "s3-backend")]
@@ -59,6 +62,13 @@ impl Location {
         }
     }
 
+    fn local(url: Url, base: PathBuf) -> Self {
+        Self {
+            url,
+            kind: LocationBackend::Local(base),
+        }
+    }
+
     #[cfg(feature = "s3-backend")]
     fn s3(url: Url, cfg: S3Location) -> Self {
         Self {
@@ -77,6 +87,19 @@ impl Location {
         matches!(self.kind, LocationBackend::Http)
     }
 
+    /// Indicates whether this location uses the local filesystem backend.
+    pub const fn is_local(&self) -> bool {
+        matches!(self.kind, LocationBackend::Local(_))
+    }
+
+    /// Returns the base path for local filesystem locations.
+    pub fn as_local_path(&self) -> Option<&Path> {
+        match &self.kind {
+            LocationBackend::Local(path) => Some(path.as_path()),
+            _ => None,
+        }
+    }
+
     /// Returns the S3-backed configuration if available.
     #[cfg(feature = "s3-backend")]
     pub fn as_s3(&self) -> Option<Arc<S3Location>> {
@@ -90,6 +113,7 @@ impl Location {
 #[derive(Debug)]
 enum LocationBackend {
     Http,
+    Local(PathBuf),
     #[cfg(feature = "s3-backend")]
     S3(Arc<S3Location>),
 }
@@ -136,7 +160,34 @@ fn resolve_location(kind: LocationKind) -> Result<Location, LocationError> {
         }
     }
 
-    let url = Url::parse(&raw).map_err(|err| LocationError::InvalidUrl(raw.clone(), err))?;
+    if raw.starts_with("file:") {
+        let url = Url::parse(&raw).map_err(|err| LocationError::InvalidUrl(raw.clone(), err))?;
+        let path = url
+            .to_file_path()
+            .map_err(|_| LocationError::InvalidFileUrl(raw.clone()))?;
+        return Ok(Location::local(url, path));
+    }
+
+    let url = match Url::parse(&raw) {
+        Ok(url) => url,
+        Err(err) => {
+            let maybe_path = Path::new(&raw);
+            if maybe_path.is_absolute() {
+                let url = Url::from_directory_path(maybe_path)
+                    .map_err(|_| LocationError::InvalidUrl(raw.clone(), err))?;
+                return Ok(Location::local(url, maybe_path.to_path_buf()));
+            }
+            return Err(LocationError::InvalidUrl(raw.clone(), err));
+        }
+    };
+
+    if url.scheme() == "file" {
+        let path = url
+            .to_file_path()
+            .map_err(|_| LocationError::InvalidFileUrl(raw.clone()))?;
+        return Ok(Location::local(url, path));
+    }
+
     Ok(Location::http(url))
 }
 
@@ -161,6 +212,9 @@ pub enum LocationError {
     /// S3 backend requested but crate built without support.
     #[error("S3 backend requested but the crate was compiled without the `s3-backend` feature")]
     S3FeatureDisabled,
+    /// File URL was provided but could not be converted into a path.
+    #[error("invalid file URL {0}")]
+    InvalidFileUrl(String),
 }
 
 #[cfg(feature = "s3-backend")]
