@@ -50,7 +50,8 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
 Jetstreamer Runner with the Program Tracking plugin enabled. Pass `--with-plugin
-instruction-tracking` (or repeat the flag to run both built-ins) to change the default set:
+instruction-tracking` or `--with-plugin shred-dump` (or repeat the flag to run multiple
+built-ins) to change the default set:
 
 ### Jetstreamer Runner CLI
 
@@ -67,6 +68,9 @@ JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
+
+# Replay epoch 800 and print JSON Lines block records with shredding metadata to stdout
+cargo run --release -- 800 --with-plugin shred-dump
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same

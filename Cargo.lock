@@ -3926,6 +3926,7 @@ dependencies = [
 name = "jetstreamer-plugin"
 version = "0.5.0"
 dependencies = [
+ "bincode",
  "clickhouse",
  "dashmap",
  "futures-util",
@@ -3933,10 +3934,16 @@ dependencies = [
  "log",
  "once_cell",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "solana-address 1.1.0",
+ "solana-entry",
+ "solana-hash",
+ "solana-keypair",
+ "solana-ledger",
  "solana-message",
  "solana-sdk-ids",
+ "solana-transaction",
  "thiserror 2.0.17",
  "tokio",
  "url 2.5.7",

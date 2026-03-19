@@ -36,6 +36,7 @@ use tokio::{
 
 use crate::{
     LOG_MODULE, SharedError,
+    block::Shredding,
     epochs::{
         FetchEpochStreamOptions, epoch_to_slot_range, fetch_epoch_stream,
         fetch_epoch_stream_with_options, slot_to_epoch,
@@ -753,6 +754,8 @@ pub enum BlockData {
         executed_transaction_count: u64,
         /// Number of entries contained in the block.
         entry_count: u64,
+        /// Entry and shred index metadata decoded from Old Faithful's block payload.
+        shredding: Vec<Shredding>,
     },
     /// Marker indicating the slot appears skipped (either truly skipped or it is late and will
     /// arrive out of order).
@@ -1535,6 +1538,7 @@ where
                                                         executed_transaction_count:
                                                             this_block_executed_transaction_count,
                                                         entry_count: this_block_entry_count,
+                                                        shredding: block.shredding.clone(),
                                                     },
                                                 )
                                                 .await
