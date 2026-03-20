@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use clickhouse::{Client, Row};
+use clickhouse::Row;
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use once_cell::sync::Lazy;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use solana_message::VersionedMessage;
 use solana_sdk_ids::vote::id as vote_program_id;
 
-use crate::{Plugin, PluginFuture};
+use crate::{DbClient, Plugin, PluginDb, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
 static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotInstructionEvent>> = Lazy::new(DashMap::new);
@@ -72,7 +72,7 @@ impl Plugin for InstructionTrackingPlugin {
     fn on_transaction<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move {
@@ -109,12 +109,7 @@ impl Plugin for InstructionTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_block(
-        &self,
-        _thread_id: usize,
-        db: Option<Arc<Client>>,
-        block: &BlockData,
-    ) -> PluginFuture<'_> {
+    fn on_block(&self, _thread_id: usize, db: PluginDb, block: &BlockData) -> PluginFuture<'_> {
         let slot = block.slot();
         let block_time = block.block_time();
         let was_skipped = block.was_skipped();
@@ -144,7 +139,7 @@ impl Plugin for InstructionTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_load(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
+    fn on_load(&self, db: PluginDb) -> PluginFuture<'_> {
         async move {
             log::info!("Instruction Tracking Plugin loaded.");
             if let Some(db) = db {
@@ -177,7 +172,7 @@ impl Plugin for InstructionTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
+    fn on_exit(&self, db: PluginDb) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_pending(None);
@@ -199,7 +194,7 @@ impl Plugin for InstructionTrackingPlugin {
 }
 
 async fn write_instruction_events(
-    db: Arc<Client>,
+    db: Arc<DbClient>,
     rows: Vec<SlotInstructionEvent>,
 ) -> Result<(), clickhouse::error::Error> {
     if rows.is_empty() {
@@ -286,7 +281,9 @@ fn instruction_vote_counts(transaction: &TransactionData) -> (u64, u64) {
     (vote_count, non_vote_count)
 }
 
-async fn backfill_instruction_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
+async fn backfill_instruction_timestamps(
+    db: Arc<DbClient>,
+) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"
         INSERT INTO slot_instructions

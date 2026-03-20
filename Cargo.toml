@@ -22,7 +22,8 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = []
+default = ["clickhouse"]
+clickhouse = ["dep:jetstreamer-utils", "jetstreamer-plugin/clickhouse"]
 s3-backend = ["jetstreamer-firehose/s3-backend"]
 verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
 
@@ -108,8 +109,8 @@ tokio.workspace = true
 solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true
-jetstreamer-plugin.workspace = true
-jetstreamer-utils.workspace = true
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.5.0", default-features = false }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.5.0", optional = true }
 url.workspace = true
 solana-sysvar.workspace = true
 solana-blake3-hasher.workspace = true

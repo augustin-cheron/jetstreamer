@@ -9,9 +9,14 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = ["clickhouse"]
+clickhouse = ["dep:clickhouse"]
+
 [dependencies]
 jetstreamer-firehose.workspace = true
 
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bincode.workspace = true
@@ -19,7 +24,7 @@ solana-message.workspace = true
 solana-address.workspace = true
 tokio.workspace = true
 log.workspace = true
-clickhouse.workspace = true
+clickhouse = { workspace = true, optional = true }
 futures-util.workspace = true
 thiserror.workspace = true
 sha2.workspace = true

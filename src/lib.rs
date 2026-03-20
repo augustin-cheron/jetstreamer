@@ -127,13 +127,14 @@ pub use jetstreamer_utils as utils;
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{
-    Plugin, PluginRunner, PluginRunnerError,
-    plugins::{
-        instruction_tracking::InstructionTrackingPlugin, program_tracking::ProgramTrackingPlugin,
-        shred_dump::ShredDumpPlugin,
-    },
+    Plugin, PluginRunner, PluginRunnerError, plugins::shred_dump::ShredDumpPlugin,
 };
 use std::sync::Arc;
+
+#[cfg(feature = "clickhouse")]
+use jetstreamer_plugin::plugins::{
+    instruction_tracking::InstructionTrackingPlugin, program_tracking::ProgramTrackingPlugin,
+};
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
@@ -153,6 +154,7 @@ impl ClickhouseSettings {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "clickhouse")]
 enum ClickhouseMode {
     Auto,
     Disabled,
@@ -160,6 +162,7 @@ enum ClickhouseMode {
     Local,
 }
 
+#[cfg(feature = "clickhouse")]
 fn resolve_clickhouse_settings(default_spawn_helper: bool) -> ClickhouseSettings {
     let default_settings = ClickhouseSettings::new(true, default_spawn_helper);
 
@@ -181,6 +184,12 @@ fn resolve_clickhouse_settings(default_spawn_helper: bool) -> ClickhouseSettings
     }
 }
 
+#[cfg(not(feature = "clickhouse"))]
+fn resolve_clickhouse_settings(_default_spawn_helper: bool) -> ClickhouseSettings {
+    ClickhouseSettings::new(false, false)
+}
+
+#[cfg(feature = "clickhouse")]
 fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -226,16 +235,13 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// ### Example
 ///
 /// ```no_run
-/// use std::sync::Arc;
-///
-/// use clickhouse::Client;
 /// use jetstreamer::{
 ///     JetstreamerRunner,
 ///     firehose::{
 ///         epochs,
 ///         firehose::{BlockData, TransactionData},
 ///     },
-///     plugin::{Plugin, PluginFuture},
+///     plugin::{Plugin, PluginDb, PluginFuture},
 /// };
 ///
 /// struct Dummy;
@@ -248,7 +254,7 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///     fn on_transaction<'a>(
 ///         &'a self,
 ///         _thread_id: usize,
-///         _db: Option<Arc<Client>>,
+///         _db: PluginDb,
 ///         tx: &'a TransactionData,
 ///     ) -> PluginFuture<'a> {
 ///         Box::pin(async move {
@@ -260,7 +266,7 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///     fn on_block<'a>(
 ///         &'a self,
 ///         _thread_id: usize,
-///         _db: Option<Arc<Client>>,
+///         _db: PluginDb,
 ///         block: &'a BlockData,
 ///     ) -> PluginFuture<'a> {
 ///         Box::pin(async move {
@@ -331,6 +337,9 @@ impl Default for JetstreamerRunner {
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
+                shred_dump_debug_decode: false,
+                shred_dump_debug_view: false,
+                shred_dump_verbose: false,
                 builtin_plugins: Vec::new(),
             },
         }
@@ -425,6 +434,7 @@ impl JetstreamerRunner {
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
         let slot_range = self.config.slot_range.clone();
+        #[cfg(feature = "clickhouse")]
         let spawn_clickhouse = clickhouse_enabled
             && self.config.spawn_clickhouse
             && should_spawn_for_dsn(&self.clickhouse_dsn);
@@ -446,7 +456,7 @@ impl JetstreamerRunner {
             buffer_window_bytes,
         );
         for plugin in &self.config.builtin_plugins {
-            runner.register(plugin.instantiate());
+            runner.register(plugin.instantiate(&self.config));
         }
 
         for plugin in self.plugins {
@@ -464,8 +474,10 @@ impl JetstreamerRunner {
             .build()
             .expect("failed to build plugin runtime");
 
+        #[cfg(feature = "clickhouse")]
         let mut clickhouse_task: Option<tokio::task::JoinHandle<Result<(), ()>>> = None;
 
+        #[cfg(feature = "clickhouse")]
         if spawn_clickhouse {
             clickhouse_task = Some(runtime.block_on(async {
                 let (mut ready_rx, clickhouse_future) =
@@ -512,9 +524,16 @@ impl JetstreamerRunner {
                 );
             }
         }
+        #[cfg(not(feature = "clickhouse"))]
+        if clickhouse_enabled {
+            log::warn!(
+                "this build was compiled without ClickHouse support; continuing without database output"
+            );
+        }
 
         let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
 
+        #[cfg(feature = "clickhouse")]
         if spawn_clickhouse {
             let handle = clickhouse_task.take();
             runtime.block_on(async move {
@@ -559,6 +578,12 @@ pub struct Config {
     pub clickhouse_enabled: bool,
     /// Whether to spawn a local ClickHouse instance automatically.
     pub spawn_clickhouse: bool,
+    /// Whether `shred-dump` should include decoder-verified shred details for debugging.
+    pub shred_dump_debug_decode: bool,
+    /// Whether `shred-dump` should emit JSON debug records instead of the default shred stream.
+    pub shred_dump_debug_view: bool,
+    /// Whether `shred-dump` debug view should include verbose CAR-derived block metadata.
+    pub shred_dump_verbose: bool,
     /// Built-in plugins requested via CLI flags.
     pub builtin_plugins: Vec<BuiltinPlugin>,
 }
@@ -567,29 +592,62 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinPlugin {
     /// Program Tracking.
+    #[cfg(feature = "clickhouse")]
     ProgramTracking,
     /// Instruction Tracking.
+    #[cfg(feature = "clickhouse")]
     InstructionTracking,
-    /// Prints block records with shredding metadata to stdout.
+    /// Emits reconstructed shreds to stdout, with optional JSON debug views.
     ShredDump,
 }
 
 impl BuiltinPlugin {
     fn from_flag(value: &str) -> Option<Self> {
         match value {
+            #[cfg(feature = "clickhouse")]
             "program-tracking" => Some(Self::ProgramTracking),
+            #[cfg(feature = "clickhouse")]
             "instruction-tracking" => Some(Self::InstructionTracking),
             "shred-dump" => Some(Self::ShredDump),
             _ => None,
         }
     }
 
-    fn instantiate(self) -> Box<dyn Plugin> {
+    fn instantiate(self, config: &Config) -> Box<dyn Plugin> {
         match self {
+            #[cfg(feature = "clickhouse")]
             Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new()),
+            #[cfg(feature = "clickhouse")]
             Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new()),
-            Self::ShredDump => Box::new(ShredDumpPlugin::new()),
+            Self::ShredDump => Box::new(
+                ShredDumpPlugin::new()
+                    .with_debug_decode(config.shred_dump_debug_decode)
+                    .with_debug_view(config.shred_dump_debug_view)
+                    .with_verbose(config.shred_dump_verbose),
+            ),
         }
+    }
+}
+
+fn supported_plugin_names() -> &'static str {
+    #[cfg(feature = "clickhouse")]
+    {
+        "'program-tracking', 'instruction-tracking', or 'shred-dump'"
+    }
+    #[cfg(not(feature = "clickhouse"))]
+    {
+        "'shred-dump'"
+    }
+}
+
+fn default_builtin_plugins() -> Vec<BuiltinPlugin> {
+    #[cfg(feature = "clickhouse")]
+    {
+        vec![BuiltinPlugin::ProgramTracking]
+    }
+    #[cfg(not(feature = "clickhouse"))]
+    {
+        vec![BuiltinPlugin::ShredDump]
     }
 }
 
@@ -603,10 +661,19 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_BUFFER_WINDOW`: Optional ripget sequential window size (for example `4GiB`).
 ///
 /// CLI flags:
-/// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking`,
-///   `instruction-tracking`, or `shred-dump`). When omitted, the CLI defaults to
-///   `program-tracking`.
+/// - `--with-plugin <name>`: Adds one of the built-in plugins supported by the current build.
+///   ClickHouse-enabled builds support `program-tracking`, `instruction-tracking`, and
+///   `shred-dump`; no-ClickHouse builds support `shred-dump`. When omitted, the CLI defaults to
+///   `program-tracking` on ClickHouse builds and `shred-dump` otherwise.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
+/// - `--shred-dump-debug-view`: Switches `shred-dump` from its default framed binary shred
+///   stream into JSON debug records.
+/// - `--shred-dump-debug-decode`: Includes decoder-verified shred details in `shred-dump`
+///   JSON debug output. This flag requires both the `shred-dump` built-in plugin and
+///   `--shred-dump-debug-view`.
+/// - `--verbose`: Includes verbose CAR-derived block, shredding, and entry data in
+///   `shred-dump` JSON debug output. This flag requires both the `shred-dump` built-in plugin
+///   and `--shred-dump-debug-view`.
 /// - `--sequential`: Enables single-thread sequential firehose mode.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 ///
@@ -628,6 +695,9 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
+    let mut shred_dump_debug_view = false;
+    let mut shred_dump_debug_decode = false;
+    let mut shred_dump_verbose = false;
     let mut sequential_cli = false;
     let mut buffer_window_cli: Option<String> = None;
     while let Some(arg) = args.next() {
@@ -638,13 +708,23 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                     .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
                 let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
                     format!(
-                        "unknown plugin '{plugin_name}'. expected 'program-tracking', 'instruction-tracking', or 'shred-dump'"
+                        "unknown plugin '{plugin_name}'. expected '{}'",
+                        supported_plugin_names()
                     )
                 })?;
                 builtin_plugins.push(plugin);
             }
             "--no-plugins" => {
                 no_plugins = true;
+            }
+            "--shred-dump-debug-view" => {
+                shred_dump_debug_view = true;
+            }
+            "--shred-dump-debug-decode" => {
+                shred_dump_debug_decode = true;
+            }
+            "--verbose" => {
+                shred_dump_verbose = true;
             }
             "--sequential" => {
                 sequential_cli = true;
@@ -702,10 +782,28 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let builtin_plugins = if no_plugins {
         Vec::new()
     } else if builtin_plugins.is_empty() {
-        vec![BuiltinPlugin::ProgramTracking]
+        default_builtin_plugins()
     } else {
         builtin_plugins
     };
+    if (shred_dump_debug_view || shred_dump_debug_decode || shred_dump_verbose)
+        && !builtin_plugins.contains(&BuiltinPlugin::ShredDump)
+    {
+        let flag = if shred_dump_debug_view {
+            "--shred-dump-debug-view"
+        } else if shred_dump_debug_decode {
+            "--shred-dump-debug-decode"
+        } else {
+            "--verbose"
+        };
+        return Err(format!("{flag} requires the 'shred-dump' built-in plugin").into());
+    }
+    if shred_dump_verbose && !shred_dump_debug_view {
+        return Err("--verbose requires --shred-dump-debug-view".into());
+    }
+    if shred_dump_debug_decode && !shred_dump_debug_view {
+        return Err("--shred-dump-debug-decode requires --shred-dump-debug-view".into());
+    }
 
     Ok(Config {
         threads,
@@ -714,6 +812,9 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
+        shred_dump_debug_decode,
+        shred_dump_debug_view,
+        shred_dump_verbose,
         builtin_plugins,
     })
 }

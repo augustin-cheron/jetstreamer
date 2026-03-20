@@ -50,11 +50,9 @@
 //! # Examples
 //! ## Defining a Plugin
 //! ```no_run
-//! use std::sync::Arc;
-//! use clickhouse::Client;
 //! use futures_util::FutureExt;
 //! use jetstreamer_firehose::firehose::TransactionData;
-//! use jetstreamer_plugin::{Plugin, PluginFuture};
+//! use jetstreamer_plugin::{Plugin, PluginDb, PluginFuture};
 //!
 //! struct CountingPlugin;
 //!
@@ -64,7 +62,7 @@
 //!     fn on_transaction<'a>(
 //!         &'a self,
 //!         _thread_id: usize,
-//!         _db: Option<Arc<Client>>,
+//!         _db: PluginDb,
 //!         transaction: &'a TransactionData,
 //!     ) -> PluginFuture<'a> {
 //!         async move {
@@ -123,7 +121,6 @@ use std::{
     time::Duration,
 };
 
-use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
@@ -134,12 +131,28 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{signal, sync::broadcast};
+
+#[cfg(feature = "clickhouse")]
+use clickhouse::Row;
+#[cfg(feature = "clickhouse")]
 use url::Url;
 
 /// Re-exported statistics types produced by [`firehose`].
 pub use jetstreamer_firehose::firehose::{
     FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
 };
+
+/// Database client type exposed to plugins.
+#[cfg(feature = "clickhouse")]
+pub use clickhouse::Client as DbClient;
+
+/// Database client placeholder used when the crate is built without ClickHouse support.
+#[cfg(not(feature = "clickhouse"))]
+#[derive(Debug, Default)]
+pub struct DbClient;
+
+/// Optional database handle passed to plugin hooks.
+pub type PluginDb = Option<Arc<DbClient>>;
 
 // Global totals snapshot used to compute overall TPS/ETA between pulses.
 static LAST_TOTAL_SLOTS: AtomicU64 = AtomicU64::new(0);
@@ -186,7 +199,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_transaction<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         _transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
@@ -196,7 +209,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_block<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         _block: &'a BlockData,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
@@ -206,7 +219,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_entry<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         _entry: &'a EntryData,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
@@ -216,7 +229,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_reward<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         _reward: &'a RewardsData,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
@@ -226,19 +239,19 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_error<'a>(
         &'a self,
         _thread_id: usize,
-        _db: Option<Arc<Client>>,
+        _db: PluginDb,
         _error: &'a FirehoseErrorContext,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
     }
 
     /// Invoked once before the firehose starts streaming events.
-    fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
+    fn on_load(&self, _db: PluginDb) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
 
     /// Invoked once after the firehose finishes or shuts down.
-    fn on_exit(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
+    fn on_exit(&self, _db: PluginDb) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
 }
@@ -299,7 +312,8 @@ impl PluginRunner {
                 .collect(),
         );
 
-        let clickhouse = if clickhouse_enabled {
+        #[cfg(feature = "clickhouse")]
+        let clickhouse: PluginDb = if clickhouse_enabled {
             let client = Arc::new(
                 build_clickhouse_client(&self.clickhouse_dsn)
                     .with_option("async_insert", "1")
@@ -309,6 +323,12 @@ impl PluginRunner {
             upsert_plugins(client.as_ref(), plugin_handles.as_ref()).await?;
             Some(client)
         } else {
+            None
+        };
+
+        #[cfg(not(feature = "clickhouse"))]
+        let clickhouse: PluginDb = {
+            let _ = clickhouse_enabled;
             None
         };
 
@@ -328,20 +348,27 @@ impl PluginRunner {
         }
 
         let shutting_down = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "clickhouse")]
         let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>> = Arc::new(DashMap::new());
+        #[cfg(feature = "clickhouse")]
         let clickhouse_enabled = clickhouse.is_some();
+        #[cfg(feature = "clickhouse")]
         let slots_since_flush = Arc::new(AtomicU64::new(0));
 
         let on_block = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
+            #[cfg(feature = "clickhouse")]
             let slot_buffer = slot_buffer.clone();
+            #[cfg(feature = "clickhouse")]
             let slots_since_flush = slots_since_flush.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, block: BlockData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
+                #[cfg(feature = "clickhouse")]
                 let slot_buffer = slot_buffer.clone();
+                #[cfg(feature = "clickhouse")]
                 let slots_since_flush = slots_since_flush.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
@@ -370,6 +397,7 @@ impl PluginRunner {
                                 );
                                 continue;
                             }
+                            #[cfg(feature = "clickhouse")]
                             if let (Some(db_client), BlockData::Block { slot, .. }) =
                                 (clickhouse.clone(), block.as_ref())
                             {
@@ -393,6 +421,7 @@ impl PluginRunner {
                                 }
                             }
                         }
+                        #[cfg(feature = "clickhouse")]
                         if clickhouse_enabled {
                             let current = slots_since_flush
                                 .fetch_add(1, Ordering::Relaxed)
@@ -414,6 +443,7 @@ impl PluginRunner {
                             }
                         }
                     }
+                    #[cfg(feature = "clickhouse")]
                     if let Some(db_client) = clickhouse.clone() {
                         match block.as_ref() {
                             BlockData::Block {
@@ -451,6 +481,13 @@ impl PluginRunner {
                                 // Drop any tallies that may exist for skipped slots.
                                 take_slot_tx_tally(*slot);
                             }
+                        }
+                    }
+                    #[cfg(not(feature = "clickhouse"))]
+                    match block.as_ref() {
+                        BlockData::Block { slot, .. }
+                        | BlockData::PossibleLeaderSkipped { slot } => {
+                            take_slot_tx_tally(*slot);
                         }
                     }
                     Ok(())
@@ -632,6 +669,7 @@ impl PluginRunner {
         LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
+        #[cfg(feature = "clickhouse")]
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
             let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
@@ -759,6 +797,8 @@ impl PluginRunner {
                 tracking_interval_slots: 100,
             }
         });
+        #[cfg(not(feature = "clickhouse"))]
+        let stats_tracking = None;
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -796,6 +836,7 @@ impl PluginRunner {
             }
         };
 
+        #[cfg(feature = "clickhouse")]
         if clickhouse_enabled
             && let Some(db_client) = clickhouse.clone()
             && let Err(err) = flush_slot_buffer(db_client, slot_buffer.clone()).await
@@ -833,8 +874,9 @@ impl PluginRunner {
     }
 }
 
-fn build_clickhouse_client(dsn: &str) -> Client {
-    let mut client = Client::default();
+#[cfg(feature = "clickhouse")]
+fn build_clickhouse_client(dsn: &str) -> DbClient {
+    let mut client = DbClient::default();
     if let Ok(mut url) = Url::parse(dsn) {
         let username = url.username().to_string();
         let password = url.password().map(|value| value.to_string());
@@ -859,6 +901,7 @@ fn build_clickhouse_client(dsn: &str) -> Client {
 #[derive(Debug, Error)]
 pub enum PluginRunnerError {
     /// ClickHouse client returned an error.
+    #[cfg(feature = "clickhouse")]
     #[error("clickhouse error: {0}")]
     Clickhouse(#[from] clickhouse::error::Error),
     /// Firehose streaming failed at the specified slot.
@@ -903,6 +946,7 @@ impl From<Arc<dyn Plugin>> for PluginHandle {
     }
 }
 
+#[cfg(feature = "clickhouse")]
 #[derive(Row, Serialize)]
 struct PluginRow<'a> {
     id: u32,
@@ -910,12 +954,14 @@ struct PluginRow<'a> {
     version: u32,
 }
 
+#[cfg(feature = "clickhouse")]
 #[derive(Row, Serialize)]
 struct PluginSlotRow {
     plugin_id: u32,
     slot: u64,
 }
 
+#[cfg(feature = "clickhouse")]
 #[derive(Row, Serialize)]
 struct SlotStatusRow {
     slot: u64,
@@ -934,7 +980,8 @@ struct SlotTxTally {
 
 static SLOT_TX_TALLY: Lazy<DashMap<u64, SlotTxTally>> = Lazy::new(DashMap::new);
 
-async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
+#[cfg(feature = "clickhouse")]
+async fn ensure_clickhouse_tables(db: &DbClient) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
             slot UInt64,
@@ -975,8 +1022,9 @@ async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::
     Ok(())
 }
 
+#[cfg(feature = "clickhouse")]
 async fn upsert_plugins(
-    db: &Client,
+    db: &DbClient,
     plugins: &[PluginHandle],
 ) -> Result<(), clickhouse::error::Error> {
     if plugins.is_empty() {
@@ -996,8 +1044,9 @@ async fn upsert_plugins(
     Ok(())
 }
 
+#[cfg(feature = "clickhouse")]
 async fn record_plugin_slot(
-    db: Arc<Client>,
+    db: Arc<DbClient>,
     plugin_id: u16,
     slot: u64,
 ) -> Result<(), clickhouse::error::Error> {
@@ -1014,8 +1063,9 @@ async fn record_plugin_slot(
     Ok(())
 }
 
+#[cfg(feature = "clickhouse")]
 async fn flush_slot_buffer(
-    db: Arc<Client>,
+    db: Arc<DbClient>,
     buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>>,
 ) -> Result<(), clickhouse::error::Error> {
     let mut rows = Vec::new();
@@ -1039,8 +1089,9 @@ async fn flush_slot_buffer(
     Ok(())
 }
 
+#[cfg(feature = "clickhouse")]
 async fn record_slot_status(
-    db: Arc<Client>,
+    db: Arc<DbClient>,
     slot: u64,
     thread_id: usize,
     transaction_count: u64,

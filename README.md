@@ -69,8 +69,18 @@ JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
 
-# Replay epoch 800 and print JSON Lines block records with shredding metadata to stdout
-cargo run --release -- 800 --with-plugin shred-dump
+# Replay epoch 800 and emit only reconstructed shreds as a framed binary stream
+# Each frame is: 4-byte big-endian payload length, then raw shred payload bytes
+cargo run --release -- 800 --with-plugin shred-dump > shreds.bin
+
+# Replay epoch 800 and inspect reconstructed shreds as JSON
+cargo run --release -- 800 --with-plugin shred-dump --shred-dump-debug-view | jq .
+
+# Replay epoch 800 and include decoder-verified shred details in the JSON debug view
+cargo run --release -- 800 --with-plugin shred-dump --shred-dump-debug-view --shred-dump-debug-decode | jq .
+
+# Replay epoch 800 and include verbose CAR-derived block, shredding, and entry data in the JSON debug view
+cargo run --release -- 800 --with-plugin shred-dump --shred-dump-debug-view --verbose | jq .
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same
